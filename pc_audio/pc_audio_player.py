@@ -1,371 +1,419 @@
+# =============================================================================
+# IMPORTAZIONI
+# Librerie standard: argparse, json, re, threading, datetime, pathlib
+# Libreria esterna obbligatoria: serial (comunicazione con STM32 via USB/UART)
+#
+# numpy e sounddevice sono importate in modo lazy dentro TonePlayer:
+# se il firmware è compilato con USE_PC_AUDIO=0, la STM32 non invierà mai
+# comandi "AUDIO *" e TonePlayer non verrà mai istanziato, quindi queste
+# librerie non servono e non è necessario averle installate.
+# =============================================================================
 import argparse
 import json
 import re
 import threading
 from datetime import datetime
 from pathlib import Path
-
-import numpy as np
 import serial
-import sounddevice as sd
 
 
-RESULT_LINE_RE = re.compile(r"^Freq\s+(\d+)\s+Hz\s+→\s+(-?\d+(?:\.\d+)?)\s+dBFS$")
+# =============================================================================
+# COSTANTI GLOBALI
+#
+# RESULT_LINE_RE – riconosce le righe di risultato audiometrico nella forma:
+#   "Freq  500 Hz → -54.5 dBFS"
+#   Gruppo 1 = frequenza in Hz, gruppo 2 = valore dBFS.
+#   "\S+" al posto di "→" rende il match robusto a qualsiasi codifica del
+#   carattere Unicode U+2192 (può arrivare corrotto su UART).
+# =============================================================================
+RESULT_LINE_RE = re.compile(
+    r"^Freq\s+(\d+)\s+Hz\s+\S+\s+(-?\d+(?:\.\d+)?)\s+dBFS$"
+)
+NOT_PERCEIVED = -100.0
 
 
+# =============================================================================
+# CLASSE ResultCollector
+#
+# Accumula le righe UART del blocco risultati, le interpreta e salva un JSON.
+#
+# Flusso atteso dal firmware (identico per USE_PC_AUDIO 0 o 1):
+#   1. "=== Risultati Audiometria ===" → attiva il parsing
+#   2. "Orecchio L" / "Orecchio R"    → imposta orecchio corrente
+#   3. "Freq  500 Hz → -54.5 dBFS"   → riga di misura
+#   4. Quando tutti i valori sono arrivati → salva JSON e si azzera
+# =============================================================================
 class ResultCollector:
-    def __init__(self, output_dir: str, expected_ears=None, expected_freq_count: int = 11):
+    """Parsing e salvataggio dei risultati audiometrici ricevuti via UART."""
+
+    def __init__(self, output_dir: str, expected_freq_count: int = 11):
         self.output_dir = Path(output_dir)
-        self.expected_ears = expected_ears or ("L", "R")
         self.expected_freq_count = expected_freq_count
         self.reset()
 
     def reset(self):
         self.in_results_block = False
         self.current_ear = None
-        self.results = {ear: {} for ear in self.expected_ears}
+        self.results = {"L": {}, "R": {}}
 
     def feed_line(self, line: str):
+        """
+        Analizza una riga decodificata dalla seriale.
+        Restituisce (payload, path) quando il test è completo, None altrimenti.
+        """
         text = line.strip()
 
         if text == "=== Risultati Audiometria ===":
             self.in_results_block = True
-            self.current_ear = None
             return None
 
         if not self.in_results_block:
             return None
 
         if text.startswith("Orecchio "):
-            ear = text.split()[-1].upper()
-            if ear not in self.results:
-                self.results[ear] = {}
-            self.current_ear = ear
+            self.current_ear = text.split()[-1].upper()
             return None
 
         match = RESULT_LINE_RE.match(text)
-        if match and self.current_ear is not None:
+        if match and self.current_ear:
             freq_hz = int(match.group(1))
-            dbfs = float(match.group(2))
+            dbfs    = float(match.group(2))
             self.results[self.current_ear][freq_hz] = dbfs
 
             if self._is_complete():
                 payload = self._build_payload()
-                paths = self._save(payload)
+                path    = self._save(payload)
                 self.reset()
-                return payload, paths
+                return payload, path
 
         return None
 
-    def _is_complete(self) -> bool:
-        for ear in self.expected_ears:
-            if len(self.results.get(ear, {})) < self.expected_freq_count:
-                return False
-        return True
+    def _is_complete(self):
+        return all(
+            len(self.results[ear]) >= self.expected_freq_count
+            for ear in ["L", "R"]
+        )
 
     def _build_payload(self):
-        left = self.results.get("L", {})
-        right = self.results.get("R", {})
-        common_freq = sorted(set(left.keys()) & set(right.keys()))
+        import math
 
-        if common_freq:
-            lr_diff = [abs(left[f] - right[f]) for f in common_freq]
-            mean_lr_diff = sum(lr_diff) / len(lr_diff)
-            max_lr_diff = max(lr_diff)
-        else:
-            mean_lr_diff = 0.0
-            max_lr_diff = 0.0
+        def perceived(ear):
+            return [(f, v) for f, v in self.results[ear].items() if v > NOT_PERCEIVED]
 
-        def mean(values):
-            if not values:
-                return 0.0
-            return sum(values) / len(values)
+        def mean(vals):
+            return sum(vals) / len(vals) if vals else None
 
-        def std_dev(values):
-            if len(values) < 2:
-                return 0.0
-            m = mean(values)
-            var = sum((v - m) ** 2 for v in values) / len(values)
-            return var ** 0.5
+        def std(vals):
+            if len(vals) < 2:
+                return None
+            m = mean(vals)
+            return math.sqrt(sum((x - m) ** 2 for x in vals) / (len(vals) - 1))
 
-        def slope_db_per_khz(values_by_freq):
-            points = sorted(values_by_freq.items())
-            if len(points) < 2:
-                return 0.0
-            x = [p[0] / 1000.0 for p in points]
-            y = [p[1] for p in points]
-            x_mean = mean(x)
-            y_mean = mean(y)
-            num = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, y))
-            den = sum((xi - x_mean) ** 2 for xi in x)
-            if den == 0.0:
-                return 0.0
-            return num / den
+        def linear_slope(pairs):
+            if len(pairs) < 2:
+                return None
+            xs = [f / 1000.0 for f, _ in pairs]
+            ys = [v          for _, v in pairs]
+            mx, my = mean(xs), mean(ys)
+            num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+            den = sum((x - mx) ** 2        for x in xs)
+            return num / den if den != 0 else None
 
-        def classify_symmetry(mean_abs_diff):
-            if mean_abs_diff <= 2.0:
-                return "ottima"
-            if mean_abs_diff <= 4.0:
-                return "buona"
-            if mean_abs_diff <= 6.0:
-                return "discreta"
-            return "asimmetria significativa"
+        perc_L = perceived("L")
+        perc_R = perceived("R")
+        vals_L = [v for _, v in perc_L]
+        vals_R = [v for _, v in perc_R]
 
-        def classify_low_vs_high(delta_db):
-            # delta > 0: basse frequenze richiedono piu livello (atteso con cuffie consumer)
-            if delta_db >= 12.0:
-                return "forte penalizzazione basse frequenze"
-            if delta_db >= 6.0:
-                return "moderata penalizzazione basse frequenze"
-            if delta_db <= -6.0:
-                return "medie/alte piu penalizzate"
-            return "profilo abbastanza uniforme"
+        common_freqs = [
+            f for f in self.results["L"]
+            if f in self.results["R"]
+            and self.results["L"][f] > NOT_PERCEIVED
+            and self.results["R"][f] > NOT_PERCEIVED
+        ]
+        lr_diffs = [abs(self.results["L"][f] - self.results["R"][f]) for f in common_freqs]
 
         summary = {
-            "mean_dbfs": {
-                "L": mean(list(left.values())),
-                "R": mean(list(right.values())),
+            "mean_dbfs": {"L": mean(vals_L), "R": mean(vals_R)},
+            "mean_abs_lr_diff_db": mean(lr_diffs),
+            "max_abs_lr_diff_db":  max(lr_diffs) if lr_diffs else None,
+            "not_perceived_count": {
+                "L": sum(1 for v in self.results["L"].values() if v <= NOT_PERCEIVED),
+                "R": sum(1 for v in self.results["R"].values() if v <= NOT_PERCEIVED),
             },
-            "mean_abs_lr_diff_db": mean_lr_diff,
-            "max_abs_lr_diff_db": max_lr_diff,
         }
 
-        low_band = [125, 250, 500]
-        high_band = [1000, 1500, 2000, 3000, 4000, 6000, 8000]
+        mean_diff = summary["mean_abs_lr_diff_db"]
+        if   mean_diff is None:  sym_class = "non calcolabile"
+        elif mean_diff < 5.0:    sym_class = "buona"
+        elif mean_diff < 10.0:   sym_class = "moderata"
+        else:                    sym_class = "asimmetria significativa"
 
-        low_vals = [0.5 * (left[f] + right[f]) for f in low_band if f in left and f in right]
-        high_vals = [0.5 * (left[f] + right[f]) for f in high_band if f in left and f in right]
-        low_minus_high = mean(low_vals) - mean(high_vals) if low_vals and high_vals else 0.0
+        flagged = sorted([
+            f for f in common_freqs
+            if abs(self.results["L"][f] - self.results["R"][f]) > 4.0
+        ])
 
-        freq_delta = {}
-        for f in common_freq:
-            freq_delta[str(f)] = abs(left[f] - right[f])
-
-        interpretation = {
-            "symmetry": {
-                "class": classify_symmetry(mean_lr_diff),
-                "mean_abs_lr_diff_db": mean_lr_diff,
-                "max_abs_lr_diff_db": max_lr_diff,
-                "flagged_freq_abs_diff_gt_4db": [
-                    int(f) for f, d in freq_delta.items() if d > 4.0
-                ],
-            },
-            "spectral_profile": {
-                "low_band_mean_dbfs": mean(low_vals) if low_vals else 0.0,
-                "high_band_mean_dbfs": mean(high_vals) if high_vals else 0.0,
-                "low_minus_high_db": low_minus_high,
-                "class": classify_low_vs_high(low_minus_high),
-            },
-            "stability": {
-                "std_db": {
-                    "L": std_dev(list(left.values())),
-                    "R": std_dev(list(right.values())),
-                },
-                "slope_db_per_khz": {
-                    "L": slope_db_per_khz(left),
-                    "R": slope_db_per_khz(right),
-                },
-            },
-            "verdict": (
-                "Profilo complessivamente buono e simmetrico"
-                if mean_lr_diff <= 4.0
-                else "Profilo con asimmetrie da ricontrollare"
-            ),
-            "notes": [
-                "Valori in dBFS: non equivalgono a dB HL clinici.",
-                "Interpretazione influenzata da cuffie, ambiente e calibrazione master-gain.",
-            ],
+        symmetry = {
+            "class":                         sym_class,
+            "mean_abs_lr_diff_db":           mean_diff,
+            "max_abs_lr_diff_db":            summary["max_abs_lr_diff_db"],
+            "flagged_freq_abs_diff_gt_4db":  flagged,
         }
+
+        LOW_FREQS  = {125, 250, 500, 750}
+        HIGH_FREQS = {2000, 3000, 4000, 6000, 8000}
+
+        def spectral_stats(ear_pairs):
+            low  = [v for f, v in ear_pairs if f in LOW_FREQS]
+            high = [v for f, v in ear_pairs if f in HIGH_FREQS]
+            lm, hm = mean(low), mean(high)
+            diff = (lm - hm) if (lm is not None and hm is not None) else None
+            if   diff is None:  cls = "non calcolabile"
+            elif diff < 10.0:   cls = "piatto"
+            elif diff < 20.0:   cls = "lieve penalizzazione basse frequenze"
+            else:               cls = "forte penalizzazione basse frequenze"
+            return {"low_band_mean_dbfs": lm, "high_band_mean_dbfs": hm,
+                    "low_minus_high_db": diff, "class": cls}
+
+        spectral_profile = {"L": spectral_stats(perc_L), "R": spectral_stats(perc_R)}
+
+        stability = {
+            "std_db":           {"L": std(vals_L),          "R": std(vals_R)},
+            "slope_db_per_khz": {"L": linear_slope(perc_L), "R": linear_slope(perc_R)},
+        }
+
+        sp_L_cls  = spectral_profile["L"]["class"]
+        sp_R_cls  = spectral_profile["R"]["class"]
+        both_flat = (sp_L_cls == "piatto" and sp_R_cls == "piatto")
+
+        if   sym_class == "buona" and both_flat:
+            verdict = "Profilo complessivamente buono e simmetrico"
+        elif sym_class == "buona":
+            verdict = "Buona simmetria L-R, ma profilo spettrale non uniforme"
+        elif sym_class == "moderata" and both_flat:
+            verdict = "Profilo spettrale uniforme, ma asimmetria L-R moderata da monitorare"
+        elif sym_class == "asimmetria significativa":
+            verdict = "Asimmetria L-R significativa: valutare con un audiologo"
+        else:
+            verdict = "Profilo variabile: confrontare con misure cliniche calibrate"
 
         return {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "results": {
-                "L": {str(k): v for k, v in sorted(left.items())},
-                "R": {str(k): v for k, v in sorted(right.items())},
+                e: {str(k): v for k, v in sorted(d.items())}
+                for e, d in self.results.items()
             },
             "summary": summary,
-            "interpretation": interpretation,
+            "interpretation": {
+                "symmetry":         symmetry,
+                "spectral_profile": spectral_profile,
+                "stability":        stability,
+                "verdict":          verdict,
+                "notes": [
+                    "Valori in dBFS: non equivalgono a dB HL clinici.",
+                    "Interpretazione influenzata da cuffie, ambiente e calibrazione master-gain.",
+                ],
+            },
         }
 
     def _save(self, payload):
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path = self.output_dir / f"audiometry_{stamp}.json"
-
-        with json_path.open("w", encoding="utf-8") as fh:
+        path = self.output_dir / f"audiometry_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
+        return path
 
-        return json_path
 
-
+# =============================================================================
+# CLASSE TonePlayer
+#
+# Istanziata automaticamente alla prima ricezione di un comando "AUDIO START",
+# quindi solo se il firmware è compilato con USE_PC_AUDIO=1.
+# Con USE_PC_AUDIO=0 la STM32 non invia mai comandi AUDIO e questa classe
+# non viene mai istanziata: numpy e sounddevice rimangono non importate.
+#
+# Sintesi audio: DDS con Look-Up Table a 4096 campioni + interpolazione
+# lineare tra campioni adiacenti per ridurre la distorsione armonica.
+# Routing stereo: L / R / B (entrambi) in base all'orecchio indicato dal C.
+# Thread safety: tutte le variabili di stato sono protette da threading.Lock
+# perché il callback audio gira su un thread separato di sounddevice.
+# =============================================================================
 class TonePlayer:
+    """Motore audio DDS lazy: viene creato solo se arriva un comando AUDIO START."""
+
     def __init__(self, samplerate: int, master_gain: float):
-        self.samplerate = samplerate
+        global np, sd
+        import numpy as np
+        import sounddevice as sd
+
+        self.samplerate  = samplerate
         self.master_gain = max(0.01, min(1.0, float(master_gain)))
-        self.phase = 0.0
-        self.freq = 440.0
-        self.gain = 0.0
-        self.ear = "L"
+        self.lock        = threading.Lock()
+
+        self.phase   = 0.0
+        self.freq    = 440.0
+        self.gain    = 0.0
+        self.ear     = "L"
         self.playing = False
-        self.lock = threading.Lock()
+
+        self.lut_size = 4096
+        self.lut = np.sin(
+            2.0 * np.pi * np.arange(self.lut_size) / self.lut_size
+        ).astype(np.float32)
 
         self.stream = sd.OutputStream(
-            samplerate=self.samplerate,
-            channels=2,
-            dtype="float32",
-            callback=self._callback,
-            blocksize=0,
+            samplerate=self.samplerate, channels=2,
+            dtype="float32", callback=self._callback
         )
         self.stream.start()
+        print("[audio] Stream aperto (USE_PC_AUDIO=1 rilevato dal firmware)")
 
     def _callback(self, outdata, frames, _time, status):
         if status:
-            print(f"[audio] {status}")
+            print(f"[audio status] {status}")
 
         with self.lock:
-            playing = self.playing
-            freq = self.freq
-            gain = self.gain
-            ear = self.ear
-            phase = self.phase
+            if not self.playing or self.gain <= 0.0:
+                outdata.fill(0)
+                return
+            curr_freq  = self.freq
+            curr_gain  = self.gain
+            curr_ear   = self.ear
+            curr_phase = self.phase
 
-        if not playing or gain <= 0.0:
-            outdata.fill(0)
-            return
+        step    = curr_freq * self.lut_size / self.samplerate
+        samples = np.empty(frames, dtype=np.float32)
 
-        phase_inc = 2.0 * np.pi * freq / self.samplerate
-        idx = np.arange(frames, dtype=np.float32)
-        samples = np.sin(phase + phase_inc * idx) * (gain * self.master_gain)
+        for i in range(frames):
+            idx0 = int(curr_phase) % self.lut_size
+            idx1 = (idx0 + 1) % self.lut_size
+            frac = curr_phase - int(curr_phase)
+            samples[i] = self.lut[idx0] + frac * (self.lut[idx1] - self.lut[idx0])
+            curr_phase = (curr_phase + step) % self.lut_size
 
-        phase = (phase + phase_inc * frames) % (2.0 * np.pi)
+        samples *= (curr_gain * self.master_gain)
+
         with self.lock:
-            self.phase = phase
+            self.phase = curr_phase
 
         stereo = np.zeros((frames, 2), dtype=np.float32)
-        if ear == "R":
-            stereo[:, 1] = samples.astype(np.float32)
-        elif ear == "B":
-            stereo[:, 0] = samples.astype(np.float32)
-            stereo[:, 1] = samples.astype(np.float32)
+        if curr_ear == "R":
+            stereo[:, 1] = samples
+        elif curr_ear == "B":
+            stereo[:, 0] = stereo[:, 1] = samples
         else:
-            stereo[:, 0] = samples.astype(np.float32)
-
+            stereo[:, 0] = samples
         outdata[:] = stereo
 
-    def start(self, ear: str, freq: float, gain: float):
+    def start(self, ear, freq, gain):
         with self.lock:
-            self.ear = (ear or "L").upper()
-            self.freq = max(20.0, float(freq))
-            self.gain = max(0.0, min(1.0, float(gain)))
+            self.ear     = ear.upper()
+            self.freq    = float(freq)
+            self.gain    = float(gain)
+            self.phase   = 0.0
             self.playing = True
-        effective = self.gain * self.master_gain
-        print(f"[tone] START ear={self.ear} freq={self.freq:.1f}Hz gain={self.gain:.3f} effective={effective:.3f}")
+        print(f"[tone] START {self.ear} {self.freq}Hz Gain:{self.gain:.3f}")
 
-    def set_gain(self, ear: str, gain: float):
+    def set_gain(self, ear, gain):
         with self.lock:
-            self.ear = (ear or self.ear or "L").upper()
-            self.gain = max(0.0, min(1.0, float(gain)))
-        effective = self.gain * self.master_gain
-        print(f"[tone] GAIN ear={self.ear} {self.gain:.3f} effective={effective:.3f}")
+            if ear:
+                self.ear = ear.upper()
+            self.gain = float(gain)
+        print(f"[tone] GAIN {self.ear} {self.gain:.3f}")
 
     def stop(self):
         with self.lock:
             self.playing = False
-            self.gain = 0.0
+            self.gain    = 0.0
         print("[tone] STOP")
 
     def close(self):
         self.stream.stop()
         self.stream.close()
+        print("[audio] Stream chiuso")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="STM32 audiometer PC audio player")
-    parser.add_argument("--port", required=True, help="Serial port, e.g. COM5")
-    parser.add_argument("--baud", type=int, default=115200, help="Serial baudrate")
-    parser.add_argument("--samplerate", type=int, default=48000, help="Audio sample rate")
-    parser.add_argument(
-        "--master-gain",
-        type=float,
-        default=0.10,
-        help="Global attenuation [0.01..1.0] applied to all tones (default: 0.10)",
-    )
-    parser.add_argument(
-        "--results-dir",
-        default="pc_audio/results",
-        help="Directory where end-of-test JSON files are stored",
-    )
-    return parser.parse_args()
-
-
+# =============================================================================
+# FUNZIONE PRINCIPALE main()
+#
+# Argomenti CLI: --port (obbligatorio), --baud, --master-gain.
+# NON esiste più --no-pc-audio: è il firmware C a decidere tramite
+# #define USE_PC_AUDIO se inviare o meno comandi AUDIO sulla UART.
+#
+# TonePlayer viene creato la prima volta che arriva "AUDIO START" e rimane
+# None per tutta l'esecuzione se il firmware non lo usa mai.
+# =============================================================================
 def main():
-    args = parse_args()
-    player = TonePlayer(args.samplerate, args.master_gain)
-    collector = ResultCollector(args.results_dir)
+    parser = argparse.ArgumentParser(description="STM32 Audiometer Interface")
+    parser.add_argument("--port",        required=True,
+                        help="Porta seriale (es. COM3 o /dev/ttyACM0)")
+    parser.add_argument("--baud",        type=int,   default=115200,
+                        help="Baud rate UART (default 115200)")
+    parser.add_argument("--master-gain", type=float, default=0.2,
+                        help="Volume master per la modalità PC audio (0.01-1.0, default 0.2)")
+    args = parser.parse_args()
 
-    print(f"[serial] Opening {args.port} @ {args.baud}")
-    print(f"[audio] master_gain={player.master_gain:.2f}")
-    ser = serial.Serial(args.port, args.baud, timeout=1)
+    # TonePlayer viene creato lazily alla prima ricezione di "AUDIO START".
+    # Se il firmware usa USE_PC_AUDIO=0, questa variabile resterà None
+    # per tutta l'esecuzione e numpy/sounddevice non verranno mai importati.
+    player: TonePlayer | None = None
 
+    collector = ResultCollector("results")
+
+    print(f"[system] Connessione a {args.port} ({args.baud} baud)...")
     try:
-        while True:
-            raw = ser.readline()
-            if not raw:
-                continue
+        ser = serial.Serial(args.port, args.baud, timeout=0.1)
 
-            line = raw.decode("utf-8", errors="ignore").strip()
+        while True:
+            raw  = ser.readline()
+            line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
 
-            print(f"[rx] {line}")
+            print(f"[mcu] {line}")
 
+            # ---- Raccolta risultati audiometrici ----
+            # Funziona uguale sia con USE_PC_AUDIO=0 che =1.
             collected = collector.feed_line(line)
-            if collected is not None:
-                payload, json_path = collected
-                summary = payload["summary"]
-                interpretation = payload["interpretation"]
-                print(
-                    "[results] Salvato JSON: "
-                    f"{json_path} | "
-                    f"mean L={summary['mean_dbfs']['L']:.2f} dBFS "
-                    f"mean R={summary['mean_dbfs']['R']:.2f} dBFS "
-                    f"mean |L-R|={summary['mean_abs_lr_diff_db']:.2f} dB | "
-                    f"verdetto={interpretation['verdict']}"
-                )
+            if collected:
+                print(f"[system] Test completato! Risultati salvati in: {collected[1]}")
 
+            # ---- Gestione comandi AUDIO ----
+            # Questi comandi arrivano SOLO se il firmware è compilato con
+            # USE_PC_AUDIO=1. Con USE_PC_AUDIO=0 la STM32 non li invia mai,
+            # quindi questo blocco rimane inattivo senza alcuna configurazione
+            # manuale: il comportamento segue automaticamente quanto stabilito
+            # dal #define nel codice C.
             parts = line.split()
-            if len(parts) < 2 or parts[0] != "AUDIO":
-                continue
+            if len(parts) >= 2 and parts[0] == "AUDIO":
+                cmd = parts[1].upper()
+                try:
+                    if cmd == "START" and len(parts) >= 5:
+                        # Prima ricezione di AUDIO START: inizializza lo stream audio.
+                        if player is None:
+                            player = TonePlayer(48000, args.master_gain)
+                        player.start(parts[2], parts[3], parts[4])
 
-            cmd = parts[1].upper()
-            try:
-                if cmd == "START":
-                    if len(parts) >= 5:
-                        ear = parts[2]
-                        freq = float(parts[3])
-                        gain = float(parts[4])
-                        player.start(ear, freq, gain)
-                    elif len(parts) >= 4:
-                        freq = float(parts[2])
-                        gain = float(parts[3])
-                        player.start("L", freq, gain)
-                elif cmd == "GAIN":
-                    if len(parts) >= 4:
-                        ear = parts[2]
-                        gain = float(parts[3])
-                        player.set_gain(ear, gain)
-                    elif len(parts) >= 3:
-                        gain = float(parts[2])
-                        player.set_gain("L", gain)
-                elif cmd in {"STOP", "DONE"}:
-                    player.stop()
-            except ValueError:
-                print(f"[warn] Messaggio non valido: {line}")
+                    elif cmd == "GAIN" and len(parts) >= 4:
+                        if player is not None:
+                            player.set_gain(parts[2], parts[3])
+                        else:
+                            print("[warn] AUDIO GAIN ricevuto prima di AUDIO START, ignorato")
+
+                    elif cmd in ("STOP", "DONE"):
+                        if player is not None:
+                            player.stop()
+
+                except ValueError:
+                    print(f"[error] Parametri comando non validi: {line}")
+
     except KeyboardInterrupt:
-        print("\n[exit] Interrotto da tastiera")
+        print("\n[exit] Chiusura in corso...")
     finally:
-        player.close()
-        ser.close()
+        if player is not None:
+            player.close()
+        if "ser" in locals():
+            ser.close()
 
 
 if __name__ == "__main__":
